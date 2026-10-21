@@ -1,6 +1,6 @@
 """Build the fixed Stage2 AV context cache using native INT8 Gemma/connector math.
 
-Run offline in the Stage2 environment on one SM121 GPU. Model loading is
+Run offline in the Stage2 environment on one Thor or Spark GPU. Model loading is
 resident for this isolated encode; generation never loads these weights.
 """
 from __future__ import annotations
@@ -104,8 +104,8 @@ def build_cache(paths: dict, output):
         raise ValueError("tokenizer must come from the exact INT8 Gemma checkpoint")
 
     import torch
-    if torch.cuda.device_count() != 1 or tuple(torch.cuda.get_device_capability()) != (12, 1):
-        raise RuntimeError("offline cache generation requires one SM121 GPU")
+    from .hardware import require_supported_gpu
+    require_supported_gpu(torch)
     started = time.monotonic_ns()
     output.parent.mkdir(parents=True, exist_ok=True)
     gemma_builder, connector_builder = _text_builders(gemma_path, connector_path)

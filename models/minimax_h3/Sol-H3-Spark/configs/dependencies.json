@@ -56,7 +56,8 @@
         "packages/ltx-core",
         "packages/ltx-pipelines",
         "packages/ltx-kernels"
-      ]
+      ],
+      "patch_manifest": "patches/ltx-cuda-toolkit-includes.json"
     },
     {
       "key": "h3_upscaler_root",
@@ -66,9 +67,38 @@
       "license": "No explicit license file or model-card license found at the pin; upstream terms unresolved",
       "source_file": "nodes/minimax_h3_latent_upscaler_3d.py",
       "source_sha256": "744063b43e0f3eec23e2485cb7c65503069946ca9690906ecb548d7515cb89e2"
+    },
+    {
+      "key": "cudnn_frontend_root",
+      "directory": "cudnn-frontend",
+      "repository": "https://github.com/NVIDIA/cudnn-frontend.git",
+      "revision": "f77fbc3d21be3f24cd0286b9b368105f7c518b8a",
+      "release": "v1.27.0",
+      "hardware": [
+        "thor"
+      ],
+      "license": "MIT",
+      "python_packages": [
+        "."
+      ]
     }
   ],
   "environments": {
+    "thor": {
+      "python": "3.12",
+      "base_image": "registry.lazycat.cloud/catdogai/minimax-h3@sha256:1bf92822b9555db80d085a5ae4d9656706c68d2957756762f637976dfe7b75df",
+      "cuda": "13.0",
+      "observed_packages": {
+        "torch": "2.11.0",
+        "safetensors": "0.8.0",
+        "transformers": "5.12.1",
+        "triton": "3.6.0",
+        "comfy-kitchen": "0.2.31",
+        "comfy-aimdo": "0.4.15",
+        "nvidia-cutlass-dsl": "4.5.2"
+      },
+      "note": "Separate Stage1/Stage2 interpreters inherit this base. Build pinned cuDNN frontend and patched LTX kernels for SM110; isolate the pinned FA4 namespace from FA2. Thor checkpoint readers require the safetensors pread backend. This is an observed runtime inventory, not a transitive lockfile."
+    },
     "stage1": {
       "python": "3.12",
       "torch": "2.12.0+cu130",

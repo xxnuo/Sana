@@ -60,6 +60,32 @@ class FakeWorker:
 
 
 class PipelineTests(unittest.TestCase):
+    def test_thor_reserves_qwen_before_ltx_workspace(self):
+        class ThorWorker(FakeWorker):
+            def call(self, op="run", **kwargs):
+                result = super().call(op, **kwargs)
+                if self.name == "stage1" and op == "run":
+                    result["actual"] = {"compute_capability": [11, 0]}
+                return result
+        FakeWorker.events = []
+        case = {"case_id": "example", "prompt": "A corgi.", "seed": 42}
+        with tempfile.TemporaryDirectory() as directory:
+            pipeline = Pipeline({}, Path(directory) / "run", worker_factory=ThorWorker)
+            try:
+                pipeline.start(case)
+                pipeline.generate(case)
+                events = FakeWorker.events
+                starts = [i for i, event in enumerate(events) if event == ("start", "qwen")]
+                self.assertEqual(len(starts), 2)
+                self.assertLess(starts[1], events.index(("start", "stage2")))
+                self.assertGreater(starts[1], events.index(("call", "stage1", "run")))
+                qwen_calls = [i for i, event in enumerate(events) if event == ("call", "qwen", "run")]
+                self.assertEqual(len(qwen_calls), 3)
+                self.assertLess(starts[1], qwen_calls[1])
+                self.assertLess(qwen_calls[1], events.index(("start", "stage2")))
+            finally:
+                pipeline.close()
+
     def test_residency_order_and_real_endpoint(self):
         FakeWorker.events = []
         case = {"case_id": "example", "prompt": "A bird glides over a mountain lake.", "seed": 42}
@@ -264,6 +290,11 @@ class PipelineTests(unittest.TestCase):
         self.assertIn("/deps/fa4/nvidia_cutlass_dsl/python_packages", env["PYTHONPATH"])
         self.assertEqual(env["HF_HUB_OFFLINE"], "1")
         self.assertNotIn("HF_TOKEN", env)
+        for configured in (None, "max_split_size_mb:128"):
+            inherited = {} if configured is None else {"PYTORCH_CUDA_ALLOC_CONF": configured}
+            with mock.patch.dict("os.environ", inherited, clear=True):
+                env = worker_environment("stage1", paths)
+            self.assertEqual(env["PYTORCH_CUDA_ALLOC_CONF"], configured or "expandable_segments:True")
 
 
 if __name__ == "__main__":

@@ -1,5 +1,6 @@
 """CPU-only handoff, normalization and offline-conditioning behavior checks."""
 import copy
+from contextlib import nullcontext
 import json
 import math
 from pathlib import Path
@@ -7,12 +8,13 @@ import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from runtime import latent_transfer as transfer
 from runtime import prompt_cache as cache
 from runtime import stage2
+from runtime.stage2_ops.models import checkpoint_reader
 
 
 class Tensor:
@@ -58,6 +60,41 @@ def cache_payload():
 
 
 class Stage2ContractTests(unittest.TestCase):
+    def test_pread_reader_is_scoped_and_restored_on_error(self):
+        original = SimpleNamespace(safe_open=Mock(return_value=nullcontext("reader")))
+        loader = SimpleNamespace(safetensors=original)
+        with tempfile.NamedTemporaryFile() as file, patch.dict(
+                sys.modules, {"ltx_core.loader": SimpleNamespace(sft_loader=loader)}):
+            with self.assertRaisesRegex(RuntimeError, "load failed"):
+                with checkpoint_reader(enabled=True) as receipt:
+                    with loader.safetensors.safe_open(file.name, framework="pt") as reader:
+                        self.assertEqual(reader, "reader")
+                    original.safe_open.assert_called_once_with(file.name, framework="pt", backend="pread")
+                    self.assertEqual(receipt["opens"], 1)
+                    raise RuntimeError("load failed")
+            self.assertIs(loader.safetensors, original)
+            with checkpoint_reader(enabled=False) as receipt:
+                self.assertIs(loader.safetensors, original)
+                self.assertEqual(receipt["opens"], 0)
+
+    def test_idle_cache_retains_thor_workspace_only(self):
+        for capability in ((11, 0), (12, 1)):
+            with self.subTest(capability=capability):
+                value = object.__new__(stage2.Session)
+                value.closed = value.failed = False
+                value.prepared = value.current_capture = None
+                cuda = Mock()
+                cuda.get_device_capability.return_value = capability
+                cuda.memory_reserved.return_value = 100
+                cuda.memory_allocated.return_value = 80
+                value.torch = SimpleNamespace(cuda=cuda)
+                receipt = value.release_idle_cache()
+                self.assertEqual(cuda.empty_cache.call_count, int(capability != (11, 0)))
+                self.assertEqual(receipt["allocator_cache_retained"], capability == (11, 0))
+                value.prepared = {}
+                with self.assertRaisesRegex(RuntimeError, "idle"):
+                    value.release_idle_cache()
+
     def test_cache_copies_both_modalities_without_mutating_template(self):
         cached = cache.FixedPromptCache(cache_payload(), prompt=cache.FIXED_PROMPT, torch_module=TORCH)
         first = cached.contexts(cache.FIXED_PROMPT, "cpu")

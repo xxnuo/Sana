@@ -36,6 +36,8 @@ def worker_environment(name, paths):
         env.pop(key, None)
     roots = [str(PACKAGE)]
     if name == "stage1":
+        # Release BF16-to-FP8 loading holes before the resident LTX model loads.
+        env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
         if paths.get("fa4_dependencies"):
             roots.extend([paths["fa4_dependencies"],
                           str(Path(paths["fa4_dependencies"]) / "nvidia_cutlass_dsl/python_packages")])
@@ -115,8 +117,8 @@ class Worker:
 class Pipeline:
     """Reuse three isolated runtime environments and the same models for a batch.
 
-    A full warmup precedes permanent Qwen residency to bound Stage2's initial
-    loading peak. It is reported separately; the first formal request counts.
+    Warmup is reported separately; the first formal request counts. Thor loads
+    resident Qwen before LTX's workspace, while Spark retains its loading order.
     """
 
     def __init__(self, paths, output_root, *, task="t2va", ref_image_match=None,
@@ -153,11 +155,17 @@ class Pipeline:
             temporary_qwen.close()
         s1 = self.stage1.call(case=warmup, conditioning_path=conditioning["conditioning_path"],
                               outputdir=str(request / "stage1"))
+        # Thor's bounded pread loader permits resident Qwen before LTX loads.
+        # Allocate its weights before LTX's warm workspace fragments free pages.
+        if s1.get("actual", {}).get("compute_capability") == [11, 0]:
+            self.qwen = self.worker_factory("qwen", self.root / "qwen-worker", self.paths, self.config)
+            self.qwen.call(case=warmup, output_root=str(self.root / "resident-qwen-warmup"))
         self.stage2 = self.worker_factory("stage2", self.root / "stage2-worker", self.paths, self.config)
         self.stage2.call("prepare", request_id="warmup", output_root=str(request / "stage2"))
         s2 = self.stage2.call(capture_dir=s1["capture_dir"], output_root=str(request / "stage2"), request_id="warmup")
         self.stage2.call("release_idle_cache")
-        self.qwen = self.worker_factory("qwen", self.root / "qwen-worker", self.paths, self.config)
+        if self.qwen is None:
+            self.qwen = self.worker_factory("qwen", self.root / "qwen-worker", self.paths, self.config)
         self.report.update(status="READY", startup_and_warmup_s=(time.monotonic_ns() - started) / 1e9,
                            warmup={"case_id": case["case_id"], "seed": 999, "output": s2["output"]})
         self.save()

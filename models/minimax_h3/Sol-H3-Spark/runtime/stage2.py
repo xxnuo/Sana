@@ -19,7 +19,7 @@ from .latent_transfer import (WIRE_METADATA, load_latent_capture, load_payload,
 from .prompt_cache import FIXED_PROMPT, load_cache
 from .stage2_ops.h3_upscale import (ADAPTER_OUTPUT, H3_INPUT, H3_UPSCALED,
                                    REFINER_INPUT, upscale_comfy_normalized_h3)
-from .stage2_ops.models import SIGMAS, TILES, construct, public_refiner_modules
+from .stage2_ops.models import SIGMAS, TILES, checkpoint_reader, construct, public_refiner_modules
 from .stage2_ops.conv_direct_nhwc import installed_direct_upsample_nhwc
 from .stage2_ops.writer_chunking import tracked_writer_chunks
 
@@ -92,7 +92,7 @@ def _refiner_class(base, compat, session):
 
         def _checked_attention_stats(self):
             stats = self.sol_attention.stats()
-            stats.update(selected_backend=self.sol_backend, architecture="sm121-triton")
+            stats.update(selected_backend=self.sol_backend, architecture=f"sm{session.capability[0]}{session.capability[1]}-triton")
             expected = {"completed_steps": 3, "dense_calls": 3, "sol_calls": 141}
             kernel = stats.get("kernel", {})
             if (any(stats.get(key) != value for key, value in expected.items())
@@ -178,8 +178,8 @@ class Session:
         if int(os.environ.get("LOCAL_RANK", "-1")) != 0 or torch.cuda.device_count() != 1:
             raise RuntimeError("launch Stage2 with torchrun --nproc-per-node=1 and one visible GPU")
         torch.cuda.set_device(0)
-        if tuple(torch.cuda.get_device_capability(0)) != (12, 1):
-            raise RuntimeError("this release profile requires Spark SM121")
+        from .hardware import require_supported_gpu
+        self.capability = require_supported_gpu(torch)
         if not dist.is_initialized():
             dist.init_process_group("nccl")
             self._owns_dist = True
@@ -187,7 +187,7 @@ class Session:
             raise RuntimeError("Spark requires one distributed rank")
         self.prompt_cache = load_cache(self.paths["prompt_cache"], prompt=self.fixed_prompt, torch_module=torch)
         base, compat = public_refiner_modules(self.ltx_root)
-        with torch.inference_mode():
+        with checkpoint_reader(enabled=self.capability == (11, 0)) as reader, torch.inference_mode():
             self.models = _refiner_class(base, compat, self)()
         self.conv_layout_receipt = self.stack.enter_context(installed_direct_upsample_nhwc(torch_module=torch))
         self.ready_ns = time.monotonic_ns()
@@ -201,8 +201,10 @@ class Session:
             "stage2_gemma_loaded": False, "stage2_connector_loaded": False,
             "fixed_prompt_cache": self.prompt_cache.receipt(), "residency": self.models.residency,
             "all2all_copy_elision": self.models.all2all_receipt,
+            "checkpoint_reader": reader,
             "denoiser_dummy_warmup": False, "latent_only_transfer": True}
         self.timings["startup_s"] = self.session_receipt["session_initialization_s"]
+        write_new(self.work_dir / "session.json", self.session_receipt)
 
     def prepare(self, request_id, output_root):
         started_ns = time.monotonic_ns()
@@ -282,9 +284,17 @@ class Session:
             raise RuntimeError("cache release requires an idle session")
         started_ns = time.monotonic_ns()
         gc.collect()
-        self.torch.cuda.empty_cache()
+        cuda = self.torch.cuda
+        reserved_before = cuda.memory_reserved()
+        # Thor needs the warmed workspace: remapping it after Qwen loads can
+        # stall on fragmented unified-memory pages for several minutes.
+        retained = cuda.get_device_capability() == (11, 0)
+        if not retained:
+            cuda.empty_cache()
         self.torch.cuda.synchronize()
-        return {"status": "PASS", "elapsed_s": (time.monotonic_ns() - started_ns) / 1e9}
+        return {"status": "PASS", "elapsed_s": (time.monotonic_ns() - started_ns) / 1e9,
+                "allocator_cache_retained": retained, "reserved_before": reserved_before,
+                "reserved_after": cuda.memory_reserved(), "allocated": cuda.memory_allocated()}
 
     def close(self):
         if self.closed:

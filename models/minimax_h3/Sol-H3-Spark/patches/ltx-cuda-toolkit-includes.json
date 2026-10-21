@@ -1,0 +1,12 @@
+{
+  "revision": "d151147788a9284cca791edc6ce898007e727fe6",
+  "patch": "ltx-cuda-toolkit-includes.patch",
+  "patch_sha256": "b79a403b97d3c8e166b6ed617d643bf8375ae26acffe96840056770ada8a9926",
+  "files": [
+    {
+      "path": "packages/ltx-kernels/setup.py",
+      "before_sha256": "a230e557f58446d8b712f219c08f2b12637bcecc29d96e11d0dc409d1a845bca",
+      "after_sha256": "1c0cae4e97c0720cfdfeefbef36e6a76e7ff2c09cab07cc57a8f954171ad3342"
+    }
+  ]
+}

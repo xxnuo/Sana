@@ -1,6 +1,8 @@
 """CPU checks for fixed scheduling, VSA evidence and owned Qwen cleanup."""
 import copy
+from contextlib import nullcontext
 import sys
+import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
@@ -29,6 +31,50 @@ def vsa_receipt(requests):
 
 
 class Stage1Contracts(unittest.TestCase):
+    def test_thor_request_boundary_retains_workspace_and_model_identity(self):
+        for capability in ([11, 0], [12, 1]):
+            with self.subTest(capability=capability):
+                cuda = Mock()
+                cuda.memory_allocated.return_value = 100
+                cuda.memory_reserved.return_value = 120
+                worker = SimpleNamespace(pipeline=SimpleNamespace(modules={
+                    name: SimpleNamespace(_lazy_module=None if name == "vae" else object())
+                    for name in ("transformer", "vae", "audio_vae")}), _sol_h3_stage1={
+                        "task": "t2va", "compute_capability": capability, "video_vae_materializations": 0})
+                with patch.dict(sys.modules, {"torch": SimpleNamespace(cuda=cuda)}):
+                    result = stage1.finish_worker_request(worker)["inactive_cuda_cache_cleanup"]
+                self.assertTrue(result["model_identities_unchanged"])
+                self.assertEqual(result["allocator_cache_retained"], capability == [11, 0])
+                self.assertEqual(cuda.empty_cache.call_count, int(capability != [11, 0]))
+
+    def test_encoder_only_residency_preserves_encoding_modules(self):
+        tensor = SimpleNamespace(numel=lambda: 8, element_size=lambda: 4)
+        decoder = SimpleNamespace(parameters=lambda: [tensor], buffers=lambda: [])
+        model = type("AutoencoderKLMiniMaxH3", (), {})()
+        model.encoder, model.quant_conv = object(), object()
+        encoder, quant = model.encoder, model.quant_conv
+        model.decoder = model.post_quant_conv = decoder
+        self.assertEqual(stage1.discard_unused_video_decoder(model), 64)
+        self.assertIs(model.encoder, encoder)
+        self.assertIs(model.quant_conv, quant)
+        self.assertIsNone(model.decoder)
+        self.assertIsNone(model.post_quant_conv)
+        with self.assertRaisesRegex(RuntimeError, "native MiniMax"):
+            stage1.discard_unused_video_decoder(object())
+
+    def test_pread_loader_restores_native_binding_after_failure(self):
+        original = Mock(return_value=nullcontext("weights"))
+        weights = SimpleNamespace(safe_open=original)
+        with tempfile.NamedTemporaryFile() as file:
+            def load():
+                with weights.safe_open(file.name, framework="pt") as reader:
+                    self.assertEqual(reader, "weights")
+                    raise RuntimeError("load failed")
+            with self.assertRaisesRegex(RuntimeError, "load failed"):
+                stage1.load_with_pread(load, weights)
+            original.assert_called_once_with(file.name, framework="pt", backend="pread")
+        self.assertIs(weights.safe_open, original)
+
     def test_native_prompt_normalization_preserves_internal_content(self):
         original = "\nsubject_definitions:\n<Subject 1> in <Picture 3>.\n\nsummary:\nDialogue.\n"
         stage1.validate_native_prompt(original.strip(), original)

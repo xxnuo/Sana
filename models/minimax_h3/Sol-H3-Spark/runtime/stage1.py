@@ -13,6 +13,29 @@ from .stage1_ops.lookup import install_exact_t2va_lookup, quantized_linear_name
 from .stage1_ops import native, vsa, sol
 from .stage1_ops.tasks import input_spec, native_inputs, ref_lora_alpha, task_of, validate_prepared_media
 from .qwen_ops.media import reference_target_area, resolve_reference_image_size
+from .checkpoint_io import discard_file_cache, pread_open
+
+
+def load_with_pread(loader, weights):
+    """Avoid mapping each BF16 shard while Thor allocates its resident weights."""
+    original = weights.safe_open
+    weights.safe_open = functools.partial(pread_open, original)
+    try:
+        return loader()
+    finally:
+        weights.safe_open = original
+
+
+def discard_unused_video_decoder(model):
+    """This latent-transfer worker only uses the original FP32 VAE encoder."""
+    if type(model).__name__ != "AutoencoderKLMiniMaxH3":
+        raise RuntimeError("encoder-only residency requires the native MiniMax H3 VAE")
+    released = 0
+    for name in ("decoder", "post_quant_conv"):
+        module = getattr(model, name)
+        released += sum(t.numel() * t.element_size() for t in (*module.parameters(), *module.buffers()))
+        setattr(model, name, None)
+    return released
 
 
 def install_reference_image_size(reference_module, target_area):
@@ -47,6 +70,7 @@ def install_worker(worker, task="t2va", attention=None, reference_area=None,
     from .stage1_ops import native as control, capture, vsa, regional
     pipe = worker.pipeline
     state = {"task": task, "transformer_materializations": 0, "video_vae_materializations": 0,
+             "compute_capability": list(torch.cuda.get_device_capability()),
              "conditioning_calls": 0, "attention_calls": 0, "compression_gates_unused": 0,
              "transformer_forwards": 0,
              "fp8_route": "native_FastVideo_tensorwise_W8A8_after_original_BF16_LoRA_merge",
@@ -60,6 +84,12 @@ def install_worker(worker, task="t2va", attention=None, reference_area=None,
     sol_route = sol.RequestRoute(state) if attention == sol.POLICY else None
     if not is_lazy_module(pipe.modules["transformer"]) or not is_lazy_module(pipe.modules["text_encoder"]):
         raise RuntimeError("existing native lazy construction required")
+    if torch.cuda.get_device_capability() == (11, 0):
+        from fastvideo.models.loader import weight_utils
+        transformer = pipe.modules["transformer"]
+        loader = object.__getattribute__(transformer, "_lazy_loader")
+        object.__setattr__(transformer, "_lazy_loader", functools.partial(load_with_pread, loader, weight_utils))
+        state["checkpoint_reader"] = "safetensors_pread"
     # Refuse accidental native Qwen loading, including eager parameter probes.
     def forbidden_qwen():
         state["qwen_builtin_materializations"] += 1
@@ -76,6 +106,12 @@ def install_worker(worker, task="t2va", attention=None, reference_area=None,
     else:
         def record_condition_encoder(model):
             state["video_vae_materializations"] += 1
+            if torch.cuda.get_device_capability() == (11, 0):
+                state["unused_video_decoder_bytes_removed"] = discard_unused_video_decoder(model)
+                files = list(Path(pipe.fastvideo_args.model_paths["vae"]).glob("*.safetensors"))
+                for filename in files:
+                    discard_file_cache(filename)
+                state["video_vae_page_cache_advised_files"] = len(files)
             # Input/reference encoding is permitted; generated-video decoding
             # remains forbidden in this latent-transfer session.
             def no_video_decode(*args, **kwargs):
@@ -130,6 +166,9 @@ def install_worker(worker, task="t2va", attention=None, reference_area=None,
         if not tagged or merged == 0:
             raise RuntimeError("missing real LoRA merge or native FP8 targets")
         convert_model_to_fp8(model)
+        if state["compute_capability"] == [11, 0]:
+            # Discard BF16 loading holes before warming reusable FP8 workspaces.
+            torch.cuda.empty_cache()
         state.update(merged_lora_layers=merged, fp8_linears=len(tagged), fp8_linear_names=tagged,
                      fp8_weight_bytes=sum(m._fp8_weight.numel() for m in model.modules() if hasattr(m, "_fp8_weight")))
         original_model_forward = model.forward
@@ -227,7 +266,7 @@ def arm_worker(worker, case, conditioning_path, outputdir):
 
 
 def finish_worker_request(worker):
-    """Trim only inactive CUDA cache after output; keep all loaded models."""
+    """Keep models resident and retain Thor's warmed CUDA workspace."""
     import gc
     import torch
     started = time.monotonic_ns()
@@ -243,11 +282,14 @@ def finish_worker_request(worker):
     gc.collect()
     before = {"allocated_bytes": int(torch.cuda.memory_allocated()),
               "reserved_bytes": int(torch.cuda.memory_reserved())}
-    torch.cuda.empty_cache()
+    retained = worker._sol_h3_stage1.get("compute_capability") == [11, 0]
+    if not retained:
+        torch.cuda.empty_cache()
     torch.cuda.synchronize()
     after = {"allocated_bytes": int(torch.cuda.memory_allocated()),
              "reserved_bytes": int(torch.cuda.memory_reserved())}
     cleanup = {"before": before, "after": after,
+               "allocator_cache_retained": retained,
                "freed_reserved_bytes": before["reserved_bytes"] - after["reserved_bytes"],
                "model_identities_unchanged": identities == models(),
                "started_monotonic_ns": started, "completed_monotonic_ns": time.monotonic_ns(),
@@ -261,7 +303,7 @@ def finish_worker_request(worker):
 
 
 class Session:
-    """One dedicated FastVideo executor on a single SM121 GPU."""
+    """One dedicated FastVideo executor on a single Thor or Spark GPU."""
 
     def __init__(self, paths: dict, work_dir: str, config: dict):
         self.closed = False

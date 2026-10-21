@@ -1,4 +1,4 @@
-"""Native VSA routing/compression with SM121 cuDNN BSA and fused BSHD merge."""
+"""Native VSA routing/compression with tile64 cuDNN BSA and fused BSHD merge."""
 import copy
 import hashlib
 import importlib
@@ -33,9 +33,9 @@ def configure_profile(profile, backend="cudnn_bsa"):
     return {"attention_backend": "VIDEO_SPARSE_ATTN_H3", "sparsity": 0.9,
             "tile_size": 64, "prefix_mode": "exempt", "dense_layers": [],
             "dense_first_n_steps": 0, "selected_attention_backend": backend,
-            "kernel": "official_triton_tile64" if backend == "triton" else "cudnn_BSA_sm12x_tile64",
+            "kernel": "official_triton_tile64" if backend == "triton" else "cudnn_BSA_tile64",
             "compression_gates": "all_50_published_replacements_preserved",
-            "hardware_adaptation": "SM121 uses " + backend + ", not SM100a",
+            "hardware_adaptation": "SM110/SM121 use " + backend + " with native logical tile64",
             "compile_policy": "52 native fullgraph regions around opaque VSA attention",
             "full_official_precision": False}
 
@@ -212,19 +212,37 @@ def install_model(model, state, backend="cudnn_bsa"):
         "formal_layout_copy_policy": "no BSHD-to-BHSD reference copies",
         "routing_or_compression_math_changed": False}
     if backend == "cudnn_bsa":
-        if torch.cuda.get_device_capability() != (12, 1):
-            raise RuntimeError("this BSA integration gate is specifically for actual SM121")
+        from ..hardware import bsa_kernel_module, require_supported_gpu
+        capability = require_supported_gpu(torch)
+        kernel_module = bsa_kernel_module(capability)
+        record["compute_capability"] = list(capability)
         from cudnn import BSA
         bsa_forward = BSA.block_sparse_attention_forward
+        if capability == (11, 0):
+            from cudnn.block_sparse_attention._interface import _bsa_attn_fwd_sm120_blk64
+            record["kernel_entry"] = "cudnn.block_sparse_attention._interface._bsa_attn_fwd_sm120_blk64"
+            # The Spark tile64 kernel uses portable SM80 MMA and compiles for
+            # Thor. Preserve its arithmetic instead of the SM100 TMA-MMA path.
+            def bsa_forward(q, k, v, indices, *, q2k_block_nums, block_sizes,
+                            sparse_block_size, softmax_scale, layout):
+                if sparse_block_size != 64 or layout not in ("bshd", "bhsd"):
+                    raise RuntimeError("Thor BSA requires the native tile64 layout")
+                output = torch.empty_like(q)
+                view = lambda x: x.transpose(1, 2) if layout == "bshd" else x
+                _, lse = _bsa_attn_fwd_sm120_blk64(
+                    view(q), view(k), view(v), indices, 0,
+                    q2k_block_nums=q2k_block_nums, block_sizes=block_sizes,
+                    softmax_scale=softmax_scale, out=view(output))
+                return output, lse
         bsa_sources = {}
-        for name in ("api", "_interface", "csrc.fwd.sm120_blk64.bsa_fwd_sm120"):
+        for name in ("api", "_interface", kernel_module):
             path = Path(importlib.import_module("cudnn.block_sparse_attention." + name).__file__).resolve()
             bsa_sources[name] = {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
         record.update(cudnn_frontend_version=importlib.metadata.version("nvidia-cudnn-frontend"),
                       bsa_sources=bsa_sources, triton_source=record["kernel_source"],
                       triton_source_sha256=record["kernel_source_sha256"],
-                      kernel_source=bsa_sources["csrc.fwd.sm120_blk64.bsa_fwd_sm120"]["path"],
-                      kernel_source_sha256=bsa_sources["csrc.fwd.sm120_blk64.bsa_fwd_sm120"]["sha256"],
+                      kernel_source=bsa_sources[kernel_module]["path"],
+                      kernel_source_sha256=bsa_sources[kernel_module]["sha256"],
                       lse_api="BSA natural log divided by ln(2), preserving original Triton log2 return",
                       bsa_index_order={"match_triton_order": match_triton_order,
                           "metadata_reorder_calls": 0,

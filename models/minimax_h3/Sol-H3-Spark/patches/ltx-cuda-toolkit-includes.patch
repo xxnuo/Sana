@@ -1,0 +1,13 @@
+diff --git a/packages/ltx-kernels/setup.py b/packages/ltx-kernels/setup.py
+index 63cd86d..229dce2 100644
+--- a/packages/ltx-kernels/setup.py
++++ b/packages/ltx-kernels/setup.py
+@@ -117,7 +117,7 @@ def _nvidia_include_dirs() -> list[str]:
+     try:
+         import nvidia  # noqa: PLC0415
+ 
+-        return [str(p) for pkg in Path(nvidia.__path__[0]).iterdir() if (p := pkg / "include").is_dir()]
++        return ([str(Path(CUDA_HOME) / "include")] if CUDA_HOME else []) + [str(p) for pkg in Path(nvidia.__path__[0]).iterdir() if (p := pkg / "include").is_dir()]
+     except ImportError:
+         return []
+ 

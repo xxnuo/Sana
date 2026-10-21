@@ -7,19 +7,45 @@ pixel-input VAE, LTX upsampler and preview-decoder models.
 from __future__ import annotations
 
 from collections import Counter
+from contextlib import contextmanager
 import gc
 import importlib
 import os
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 
 from .h3_upscale import load_upscaler
 from .single_gpu_all2all import single_gpu_all2all_factory
+from ..checkpoint_io import pread_open
 
 SIGMAS = (0.909375, 0.725, 0.421875, 0.0)
 TILES = {"frames": {"tile_size": 128, "overlap": 24},
          "height": {"tile_size": 448, "overlap": 64},
          "width": {"tile_size": 768, "overlap": 64}}
+
+
+@contextmanager
+def checkpoint_reader(*, enabled):
+    """Bound Thor's host weight storage to each tensor using safetensors pread."""
+    receipt = {"backend": "pread" if enabled else "default", "opens": 0}
+    if not enabled:
+        yield receipt
+        return
+    from ltx_core.loader import sft_loader
+    original = sft_loader.safetensors
+
+    def safe_open(*args, **kwargs):
+        receipt["opens"] += 1
+        return pread_open(original.safe_open, *args, **kwargs)
+
+    # Replace only LTX's binding, and only during construction; other loaders
+    # keep their original implementation and all tensor transforms stay native.
+    sft_loader.safetensors = SimpleNamespace(safe_open=safe_open)
+    try:
+        yield receipt
+    finally:
+        sft_loader.safetensors = original
 
 
 def public_refiner_modules(ltx_root):

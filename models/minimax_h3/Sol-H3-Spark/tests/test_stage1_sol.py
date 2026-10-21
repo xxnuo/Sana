@@ -46,10 +46,11 @@ class SolRouteTests(unittest.TestCase):
             sink_plan([0] * 65 + [1, 2], list(range(65)), 65)
 
     def test_request_reset_runtime_routes_and_physical_counts(self):
-        state = {}
+        state = {"sol_attention": {"backend": "shared_triton_sm110"}}
         controller = RequestRoute(state)
         for _ in range(2):
             controller.prepare(self.layout())
+            self.assertEqual(state["sol_attention"]["backend"], "shared_triton_sm110")
             for step in range(4):
                 controller.start_forward()
                 for layer in range(50):

@@ -158,8 +158,8 @@ class Session:
         from .qwen_ops.conditioner import (
             MiniMaxNVFP4Conditioner, normalize_and_validate_conditioning, _import_comfy_sd,
         )
-        if torch.cuda.device_count() != 1 or tuple(torch.cuda.get_device_capability()) != (12, 1):
-            raise RuntimeError('Qwen resident runtime requires the single Spark SM121')
+        from .hardware import require_supported_gpu
+        require_supported_gpu(torch)
         self.torch = torch
         self.normalize = normalize_and_validate_conditioning
         self.before_load = resource_snapshot(torch)

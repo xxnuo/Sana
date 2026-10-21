@@ -1,6 +1,6 @@
 """One Ref2VA Sol policy around the original post-RoPE attention seam.
 
-No kernel is implemented here. SM121 uses the shared BF16 Triton Sol backend.
+No kernel is implemented here. Thor and Spark use the shared BF16 Triton Sol backend.
 The stable visual/text+audio partition changes sparse block grouping explicitly;
 Q/K/V receive the same permutation after RoPE and output is restored afterwards.
 """
@@ -62,7 +62,8 @@ class RequestRoute:
             layout.token_tags.tolist(), layout.video_indices.tolist(), layout.num_condition_video_rows)
         self.gpu_indices = None
         self.step = -1
-        self.state["sol_attention"] = {"policy": POLICY, "backend": "shared_triton_sm121",
+        backend = self.state.get("sol_attention", {}).get("backend", "shared_triton_pending")
+        self.state["sol_attention"] = {"policy": POLICY, "backend": backend,
             "qkv_dtype": "torch.bfloat16", "softmax_scale": 128 ** -0.5,
             "fallback_calls": 0, "sol_calls": 0, "full_dense_fa4_calls": 0,
             "sink_query_fa4_calls": 0, "tau_calls": {"1.0": 0, "1.25": 0, "1.5": 0},
@@ -98,8 +99,9 @@ def install(model, state, controller):
     from fastvideo.models.loader import fsdp_load
     from .regional import _layer_number
 
-    if torch.cuda.get_device_capability() != (12, 1):
-        raise RuntimeError("this Sol integration requires the shared SM121 Triton backend")
+    from ..hardware import require_supported_gpu
+    capability = require_supported_gpu(torch)
+    state["sol_attention"]["backend"] = f"shared_triton_sm{capability[0]}{capability[1]}"
     repo = str(Path(__file__).resolve().parents[5])
     if repo not in sys.path:
         sys.path.insert(0, repo)

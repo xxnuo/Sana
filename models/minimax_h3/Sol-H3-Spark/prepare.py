@@ -76,6 +76,8 @@ def arguments():
     parser.add_argument("--checkpoints", type=Path, default=ROOT / "checkpoints")
     parser.add_argument("--task", choices=TASKS, default="t2va",
                         help="Match the task selected for downloading and inference")
+    parser.add_argument("--hardware", choices=("spark", "thor"), default="spark",
+                        help="Include the pinned hardware-specific source patches")
     parser.add_argument("--sources", type=Path, default=ROOT / "dependencies")
     parser.add_argument("--paths", type=Path, help="Existing flat JSON path overrides, e.g. cached model locations")
     parser.add_argument("--output", type=Path, default=ROOT / "paths.json")
@@ -131,8 +133,10 @@ def missing_h3_components(model_root, task):
 def main():
     args = arguments()
     manifest = json.loads((ROOT / "configs/dependencies.json").read_text())
+    sources = [entry for entry in manifest["sources"]
+               if args.hardware in entry.get("hardware", ("spark", "thor"))]
     paths = checkpoint_paths(args.checkpoints, task=args.task)
-    for entry in manifest["sources"]:
+    for entry in sources:
         paths[entry["key"]] = str((args.sources / entry["directory"]).resolve())
     paths["fa4_root"] = str((args.sources / "fa4-runtime").resolve())
     if args.paths:
@@ -145,14 +149,14 @@ def main():
                        ("prompt_cache", args.prompt_cache)):
         if value is not None:
             paths[key] = str(value.expanduser().absolute())
-    upscaler = next(item for item in manifest["sources"] if item["key"] == "h3_upscaler_root")
+    upscaler = next(item for item in sources if item["key"] == "h3_upscaler_root")
     paths.setdefault("h3_upscaler_source", str(Path(paths["h3_upscaler_root"]) / upscaler["source_file"]))
     # LTX reads tokenizer JSON and processor sidecars embedded in this exact TE
     # checkpoint. It does not require a second Gemma model download.
     paths["gemma_tokenizer"] = paths["offline_gemma"]
     reused_fa4 = (Path(paths["fa4_root"]) / "flash_attn/cute").is_dir()
     if args.fetch_sources and not args.plan:
-        for entry in manifest["sources"]:
+        for entry in sources:
             if entry["key"] == "fa4_source_root" and reused_fa4:
                 continue
             fetch_source(entry, Path(paths[entry["key"]]))
@@ -164,7 +168,7 @@ def main():
                 "output_video_vae", "audio_vae", "h3_upscaler_source", "h3_upscaler_checkpoint",
                 "adapter_dir", "prompt_cache", "stage1_python", "stage2_python", "qwen_python"]
     required.append("fa4_root")
-    required.extend(item["key"] for item in manifest["sources"]
+    required.extend(item["key"] for item in sources
                     if item["key"] != "fa4_source_root" or not reused_fa4)
     if args.cache_pending:
         if not paths.get("prompt_cache"):
@@ -176,7 +180,7 @@ def main():
     if args.plan:
         print(json.dumps({"task": args.task, "paths": paths, "missing_inputs": missing,
                           "missing_model_files": missing_model_files,
-                          "source_patches": [item["patch_manifest"] for item in manifest["sources"]
+                          "source_patches": [item["patch_manifest"] for item in sources
                                              if item.get("patch_manifest")],
                           "unresolved": manifest["unresolved"],
                           "validation": "Plan only; no imports, downloads, writes or GPU validation"}, indent=2))
@@ -188,7 +192,7 @@ def main():
     for key in ("stage1_python", "stage2_python", "qwen_python"):
         if not Path(paths[key]).is_file() or not os.access(paths[key], os.X_OK):
             raise ValueError(f"{key} must be an executable Python interpreter")
-    for entry in manifest["sources"]:
+    for entry in sources:
         if entry["key"] == "fa4_source_root" and reused_fa4:
             continue
         source = Path(paths[entry["key"]])

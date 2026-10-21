@@ -1,4 +1,4 @@
-"""Compile 52 native H3 regions around opaque SM121 VSA attention."""
+"""Compile 52 native H3 regions around opaque tile64 VSA attention."""
 from types import MethodType, SimpleNamespace
 from typing import Optional
 
@@ -49,8 +49,8 @@ def install(model, state, compile_kwargs=None):
             or audit.get("active_compression_gates") != 50
             or audit.get("vsa_forward_calls") != 0 or "vsa_regional_compile" in state):
         raise RuntimeError("install once after the original fresh VSA backend audit, before any forward")
-    if torch.cuda.get_device_capability() != (12, 1):
-        raise RuntimeError("this explicit regional adaptation requires SM121")
+    from ..hardware import require_supported_gpu
+    capability = require_supported_gpu(torch)
     if _attention_compile_explicitly_disabled():
         raise RuntimeError("explicit attention compiler-disable cannot enter fullgraph regions")
     bodies, texts = [], []
@@ -128,5 +128,5 @@ def install(model, state, compile_kwargs=None):
         raise RuntimeError(f"expected native 52 attention modules/regions, got {(enabled, compiled)}")
     receipt.update(attention_modules_enabled=enabled, regions_wrapped=compiled)
     state["vsa_regional_compile"] = receipt
-    audit["compile_policy"] = "explicit SM121 opaque VSA + original 52 fullgraph regions; runtime gate required"
+    audit["compile_policy"] = f"explicit SM{capability[0]}{capability[1]} opaque VSA + original 52 fullgraph regions; runtime gate required"
     return receipt
