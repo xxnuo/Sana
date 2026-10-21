@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "variant": "jetson_thor_t5000_sm110",
+  "upstream_repo": "https://github.com/NVlabs/Sana.git",
+  "upstream_branch": "sol-engine",
+  "upstream_commit": "d0c0a4685ab5dc2336d18b7213d85f13def92418",
+  "diffusers": {
+    "repo": "https://github.com/huggingface/diffusers.git",
+    "commit": "abc5e9bf71fd38f53cd471bc3acaa84bc5ecbfdc",
+    "python_tree_sha256": "009da31ca91b3737d70e954cec1008d92732334b104c144fe10c279f0e4121c1"
+  },
+  "runtime_source_digest": "Computed at launch across Thor, GB10, and Sol-Attn Python/shell sources and included in benchmark.json sana_commit identity.",
+  "source_root": ".",
+  "core_sha256": {
+    "gpu_infer.py": "1d5418b057b0d4f8260f08586de5a4e3472c950ac11fa6d3f9ac06bafbd6de53",
+    "paths.py": "dd0256e29c1df7324f892ba784f7062a4c83bfc48d764bb00e2df3a06e07646d",
+    "run_minimax_h3_gpu.sh": "07b0f48d47c9c61a71b3aaf7135f5b8516590fee1023058be563d6bb0879fd2e"
+  },
+  "hardware": {
+    "device": "NVIDIA Jetson Thor T5000",
+    "sm": "110",
+    "memory_gib": 128,
+    "memory_kind": "unified"
+  }
+}

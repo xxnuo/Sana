@@ -129,6 +129,10 @@ def build_pruned_fp8_transformer(
                     if hasattr(module, dead):
                         delattr(module, dead)
 
+    fused_qkv_modules = sum(
+        1 for module in model.modules() if getattr(module, "fused_projections", False)
+    )
+
     # 4. The timestep path becomes a table lookup.
     model._adaln_t_table = table
     patch_pruned_adaln(model)
@@ -167,6 +171,7 @@ def build_pruned_fp8_transformer(
         "missing": missing,
         "quantized_layers": len(quant),
         "fused_qkv": fuse_qkv,
+        "fused_qkv_modules": fused_qkv_modules,
         "quantizer": quantizer,
         "fused_adaln_blocks": fused_blocks,
         "fused_rope": fuse_rope,

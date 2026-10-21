@@ -19,11 +19,33 @@ the cache is on.
 
 from __future__ import annotations
 
+import functools
+
 import paths
 
 paths.setup()
 
 import torch
+
+
+def _same_callable(first, second) -> bool:
+    """Compare bound methods without relying on transient wrapper identities."""
+    if first is second:
+        return True
+    sentinel = object()
+    first_self = getattr(first, "__self__", sentinel)
+    second_self = getattr(second, "__self__", sentinel)
+    first_func = getattr(first, "__func__", sentinel)
+    second_func = getattr(second, "__func__", sentinel)
+    if any(value is sentinel for value in (first_self, second_self, first_func, second_func)):
+        return False
+    return first_self is second_self and first_func is second_func
+
+
+def _clear_context_wrapper_state(transformer) -> None:
+    transformer._h3_cache_context_wrapped = False
+    transformer._h3_cache_original_forward = None
+    transformer._h3_cache_context_wrapper = None
 
 
 def register_h3_block() -> bool:
@@ -66,9 +88,15 @@ def apply_cache(transformer, threshold: float = 0.08) -> None:
     transformer.enable_cache(FirstBlockCacheConfig(threshold=threshold))
 
     if getattr(transformer, "_h3_cache_context_wrapped", False):
-        return
+        installed = getattr(transformer, "_h3_cache_context_wrapper", None)
+        if _same_callable(getattr(transformer, "forward", None), installed):
+            return
+        # Another hook replaced our wrapper. Start from that current method and keep ownership
+        # metadata tied to the new wrapper instead of restoring over the external hook later.
+        _clear_context_wrapper_state(transformer)
     original = transformer.forward
 
+    @functools.wraps(original)
     def forward(*args, **kwargs):
         with transformer.cache_context("denoise"):
             return original(*args, **kwargs)
@@ -76,13 +104,16 @@ def apply_cache(transformer, threshold: float = 0.08) -> None:
     transformer.forward = forward
     transformer._h3_cache_context_wrapped = True
     transformer._h3_cache_original_forward = original
+    transformer._h3_cache_context_wrapper = forward
 
 
 def remove_cache(transformer) -> None:
     """Take it off again, so one loaded model can serve cached and uncached runs."""
     if getattr(transformer, "_h3_cache_context_wrapped", False):
-        transformer.forward = transformer._h3_cache_original_forward
-        transformer._h3_cache_context_wrapped = False
+        installed = getattr(transformer, "_h3_cache_context_wrapper", None)
+        if _same_callable(getattr(transformer, "forward", None), installed):
+            transformer.forward = transformer._h3_cache_original_forward
+        _clear_context_wrapper_state(transformer)
     if getattr(transformer, "is_cache_enabled", False):
         transformer.disable_cache()
 
@@ -106,21 +137,41 @@ class SkipCounter:
 
         self.calls = 0
         self.skips = 0
-        original = FBCHeadBlockHook._should_compute_remaining_blocks
+        state = getattr(FBCHeadBlockHook, "_h3_skip_counter_patch_state", None)
+        current = FBCHeadBlockHook._should_compute_remaining_blocks
+        if not isinstance(state, dict) or current is not state.get("patched"):
+            state = {"original": current, "counters": []}
 
-        def counted(hook_self, residual):
-            compute = original(hook_self, residual)
-            self.calls += 1
-            self.skips += not compute
-            return compute
+            def counted(hook_self, residual):
+                compute = state["original"](hook_self, residual)
+                for counter in tuple(state["counters"]):
+                    counter.calls += 1
+                    counter.skips += not compute
+                return compute
 
-        FBCHeadBlockHook._should_compute_remaining_blocks = counted
-        self._original = original
+            state["patched"] = counted
+            FBCHeadBlockHook._should_compute_remaining_blocks = counted
+            FBCHeadBlockHook._h3_skip_counter_patch_state = state
+        state["counters"].append(self)
+        self._state = state
+        self._hook_class = FBCHeadBlockHook
+        self._original = state["original"]
+        self._restored = False
 
     def restore(self):
-        from diffusers.hooks.first_block_cache import FBCHeadBlockHook
-
-        FBCHeadBlockHook._should_compute_remaining_blocks = self._original
+        if self._restored:
+            return False
+        self._restored = True
+        counters = self._state["counters"]
+        if self in counters:
+            counters.remove(self)
+        current = self._hook_class._should_compute_remaining_blocks
+        if not counters:
+            if current is self._state.get("patched"):
+                self._hook_class._should_compute_remaining_blocks = self._state["original"]
+            if getattr(self._hook_class, "_h3_skip_counter_patch_state", None) is self._state:
+                delattr(self._hook_class, "_h3_skip_counter_patch_state")
+        return True
 
     def __str__(self) -> str:
         rate = self.skips / self.calls if self.calls else 0.0

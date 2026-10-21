@@ -1,0 +1,85 @@
+id = "minimax_h3_thor_kernel"
+kind = "optimized"
+purpose = "lossless"
+description = "Single Jetson Thor T5000 lossless Triton fusion profile, without cache or sparse attention."
+model_profile = "minimax_h3"
+inherit_profile_env = false
+submodule = "models/minimax_h3/Thor"
+base_commit = "snapshot:011b0150f3f3cd1714c08f9f3daa6fb3f59a122087d7257269e577f23cf789c5"
+run_script = "run_minimax_h3_gpu.sh"
+
+[runtime]
+root = "models/minimax_h3/Thor"
+
+[env]
+H3_PROMPT_FILE = "models/minimax_h3/demo_prompt.json"
+H3_HEIGHT = "256"
+H3_WIDTH = "448"
+H3_NUM_FRAMES = "124"
+H3_STEPS = "8"
+H3_SEED = "0"
+H3_OFFICIAL = "0"
+H3_WARMUP = "1"
+H3_MEASURE = "1"
+H3_OUTPUT_TYPE = "latent"
+H3_KERNEL_FUSIONS = "1"
+H3_SOL_ATTN_TAU = ""
+H3_SOL_ATTN_DENSE_LAST_STEPS = "0"
+H3_CACHE_THRESHOLD = ""
+H3_VAE_TILE_BATCH = "0"
+H3_REQUIRE_SM110 = "1"
+H3_MIN_AVAILABLE_MIB = "81920"
+H3_BENCH_RUNTIME_MIN_AVAILABLE_MIB = "16384"
+H3_VARIANT = "diffusers_modular_pruned_fp8_scaled_single_thor_sm110"
+SOL_ATTN_STRICT = "1"
+
+[official_config]
+model = "MiniMaxAI/MiniMax-H3"
+revision = "bfc8ed0353f5a9733be73e6b2c98ec0948195b86"
+transformer_model = "Comfy-Org/MiniMax-H3"
+transformer_revision = "4cc1d817b6184899b41293954329f576cb5ae86b"
+text_encoder_model = "Qwen/Qwen3-VL-32B-Instruct-FP8"
+text_encoder_revision = "4bf2c2f39c37c0fede78bede4056e1f18cdf8109"
+partition = "fl2va"
+task = "t2va"
+suite = "smoke"
+width = 448
+height = 256
+frames = 124
+fps = 24
+duration_s = 5.167
+steps = 8
+flow_shift = 12.0
+audio_flow_shift = 3.0
+audio_sample_rate = 32000
+audio_channels = 2
+seed = 0
+num_gpus = 1
+context_parallel_degree = 1
+transformer_dtype = "fp8_scaled"
+text_encoder_dtype = "fp8"
+vae_dtype = "fp32"
+vae_autocast_dtype = "fp16"
+video_vae_autocast_dtype = "fp16"
+audio_vae_autocast_dtype = "disabled"
+guidance_distilled = true
+
+[slurm]
+account = ""
+partition = ""
+qos = ""
+gpus_per_node = 1
+nodes = 1
+cpus_per_task = 64
+mem = "0"
+time = "04:00:00"
+exclusive = false
+job_name = "h3-thor-kernel"
+note = "Single Jetson Thor T5000 card; Slurm fields are intentionally site-neutral."
+
+[artifacts]
+output_dir = "outputs"
+video = "out.mp4"
+log = "run.log"
+benchmark = "benchmark.json"
+latents = "latents.safetensors"

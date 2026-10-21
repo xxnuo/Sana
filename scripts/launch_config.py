@@ -61,6 +61,51 @@ CANONICAL_ARTIFACT_DEFAULTS = {
     "patch_summary": "patch_summary.md",
     "frames_dir": "frames",
 }
+MINIMAX_H3_THOR_OFFICIAL_ENV = {
+    "width": "H3_WIDTH",
+    "height": "H3_HEIGHT",
+    "frames": "H3_NUM_FRAMES",
+    "steps": "H3_STEPS",
+    "seed": "H3_SEED",
+}
+MINIMAX_H3_THOR_SUITE_SHAPES = {
+    "smoke": {"width": 448, "height": 256, "frames": 124, "steps": 8},
+    "standard": {"width": 832, "height": 480, "frames": 124, "steps": 50},
+    "official": {"width": 1344, "height": 768, "frames": 124, "steps": 50},
+}
+# Formal Thor runs must leave enough unified-memory headroom for the runtime
+# while it is generating. Higher values are allowed, but a lower floor would
+# make otherwise identical runs incomparable and unsafe on a 128 GiB host.
+MINIMAX_H3_THOR_MIN_RUNTIME_AVAILABLE_MIB = 16_384
+MINIMAX_H3_THOR_FORMAL_REQUEST_COUNTS = {
+    "standard": {"warmup": 1, "measure": 3},
+    "official": {"warmup": 1, "measure": 3},
+}
+MINIMAX_H3_THOR_OFFICIAL_IDENTITY = {
+    "model": "MiniMaxAI/MiniMax-H3",
+    "revision": "bfc8ed0353f5a9733be73e6b2c98ec0948195b86",
+    "transformer_model": "Comfy-Org/MiniMax-H3",
+    "transformer_revision": "4cc1d817b6184899b41293954329f576cb5ae86b",
+    "text_encoder_model": "Qwen/Qwen3-VL-32B-Instruct-FP8",
+    "text_encoder_revision": "4bf2c2f39c37c0fede78bede4056e1f18cdf8109",
+    "partition": "fl2va",
+    "task": "t2va",
+    "fps": 24,
+    "duration_s": 5.167,
+    "flow_shift": 12.0,
+    "audio_flow_shift": 3.0,
+    "audio_sample_rate": 32000,
+    "audio_channels": 2,
+    "num_gpus": 1,
+    "context_parallel_degree": 1,
+    "transformer_dtype": "fp8_scaled",
+    "text_encoder_dtype": "fp8",
+    "vae_dtype": "fp32",
+    "vae_autocast_dtype": "fp16",
+    "video_vae_autocast_dtype": "fp16",
+    "audio_vae_autocast_dtype": "disabled",
+    "guidance_distilled": True,
+}
 NONBLOCKING_RUN_STATUSES = {
     "prepared",
     "failed",
@@ -117,8 +162,145 @@ def load_toml(path: Path) -> dict[str, Any]:
         return tomllib.load(f)
 
 
+def parse_toml_value(raw: str) -> Any:
+    """Parse one CLI value using TOML scalar syntax, falling back to a string."""
+    try:
+        return tomllib.loads(f"value = {raw}\n")["value"]
+    except (KeyError, TypeError, ValueError):
+        return raw
+
+
+def apply_official_config_overrides(
+    data: dict[str, Any], overrides: list[str] | None
+) -> dict[str, Any]:
+    if not overrides:
+        return data
+    official = dict(data.get("official_config") or {})
+    for item in overrides:
+        if "=" not in item:
+            raise SystemExit(f"--official-config expects KEY=VALUE, got: {item}")
+        key, raw = item.split("=", 1)
+        key = key.strip()
+        if not key or "." in key:
+            raise SystemExit(
+                f"--official-config key must be a non-empty top-level name, got: {key!r}"
+            )
+        official[key] = parse_toml_value(raw.strip())
+    merged = dict(data)
+    merged["official_config"] = official
+    return merged
+
+
 def config_id(data: dict[str, Any]) -> str:
     return manifest_id(data) or "config"
+
+
+def is_minimax_h3_thor_config(data: dict[str, Any]) -> bool:
+    return config_id(data).startswith("minimax_h3_thor_")
+
+
+def bind_minimax_h3_thor_official_config(data: dict[str, Any]) -> dict[str, Any]:
+    """Keep Thor workload metadata and the actual H3 runtime arguments together."""
+    if not is_minimax_h3_thor_config(data):
+        return data
+    official = data.get("official_config")
+    if not isinstance(official, dict):
+        raise SystemExit("MiniMax-H3 Thor configs require an official_config table")
+    suite = official.get("suite")
+    if suite not in MINIMAX_H3_THOR_SUITE_SHAPES:
+        raise SystemExit(
+            "MiniMax-H3 Thor configs require official_config.suite to be one of "
+            "smoke, standard, or official"
+        )
+    env = dict(data.get("env") or {})
+    for field, env_name in MINIMAX_H3_THOR_OFFICIAL_ENV.items():
+        if field in official:
+            env[env_name] = str(official[field])
+    env["H3_OFFICIAL"] = "1" if suite == "official" else "0"
+    # The source profiles are smoke-oriented. When a caller selects the
+    # standard/official suite, bind the formal request counts to the resolved
+    # workload so the profile's smoke defaults cannot leak into the bundle.
+    request_counts = MINIMAX_H3_THOR_FORMAL_REQUEST_COUNTS.get(suite)
+    if request_counts is not None:
+        env["H3_WARMUP"] = str(request_counts["warmup"])
+        env["H3_MEASURE"] = str(request_counts["measure"])
+    merged = dict(data)
+    merged["env"] = env
+    return merged
+
+
+def validate_minimax_h3_thor_runtime_contract(
+    data: dict[str, Any], env: dict[str, Any]
+) -> None:
+    """Reject a Thor bundle whose declared workload differs from its runner env."""
+    if not is_minimax_h3_thor_config(data):
+        return
+    official = data.get("official_config")
+    if not isinstance(official, dict):
+        raise SystemExit("MiniMax-H3 Thor configs require an official_config table")
+    suite = official.get("suite")
+    if suite not in MINIMAX_H3_THOR_SUITE_SHAPES:
+        raise SystemExit(
+            "MiniMax-H3 Thor configs require official_config.suite to be one of "
+            "smoke, standard, or official"
+        )
+    identity_mismatches = {
+        field: [official.get(field), expected]
+        for field, expected in MINIMAX_H3_THOR_OFFICIAL_IDENTITY.items()
+        if official.get(field) != expected
+    }
+    runtime_mismatches = {}
+    for field, env_name in MINIMAX_H3_THOR_OFFICIAL_ENV.items():
+        declared = official.get(field)
+        raw = env.get(env_name)
+        try:
+            actual = int(str(raw))
+        except (TypeError, ValueError):
+            actual = raw
+        if isinstance(declared, bool) or not isinstance(declared, int) or actual != declared:
+            runtime_mismatches[field] = [declared, raw]
+    if str(env.get("H3_REQUIRE_SM110", "")) != "1":
+        runtime_mismatches["H3_REQUIRE_SM110"] = ["1", env.get("H3_REQUIRE_SM110")]
+    raw_runtime_floor = env.get("H3_BENCH_RUNTIME_MIN_AVAILABLE_MIB")
+    try:
+        runtime_floor = int(str(raw_runtime_floor))
+    except (TypeError, ValueError):
+        runtime_floor = 0
+    if runtime_floor <= 0 or isinstance(raw_runtime_floor, bool):
+        runtime_mismatches["H3_BENCH_RUNTIME_MIN_AVAILABLE_MIB"] = [
+            f">={MINIMAX_H3_THOR_MIN_RUNTIME_AVAILABLE_MIB}",
+            raw_runtime_floor,
+        ]
+    elif runtime_floor < MINIMAX_H3_THOR_MIN_RUNTIME_AVAILABLE_MIB:
+        runtime_mismatches["H3_BENCH_RUNTIME_MIN_AVAILABLE_MIB"] = [
+            f">={MINIMAX_H3_THOR_MIN_RUNTIME_AVAILABLE_MIB}",
+            raw_runtime_floor,
+        ]
+    request_counts = MINIMAX_H3_THOR_FORMAL_REQUEST_COUNTS.get(suite)
+    if request_counts is not None:
+        for field, expected in request_counts.items():
+            env_name = "H3_WARMUP" if field == "warmup" else "H3_MEASURE"
+            raw = env.get(env_name)
+            try:
+                actual = int(str(raw))
+            except (TypeError, ValueError):
+                actual = raw
+            if isinstance(raw, bool) or actual != expected:
+                runtime_mismatches[env_name] = [str(expected), raw]
+    expected_official = "1" if suite == "official" else "0"
+    if str(env.get("H3_OFFICIAL", "")) != expected_official:
+        runtime_mismatches["H3_OFFICIAL"] = [expected_official, env.get("H3_OFFICIAL")]
+    for field, expected in MINIMAX_H3_THOR_SUITE_SHAPES[suite].items():
+        if official.get(field) != expected:
+            runtime_mismatches[f"suite.{field}"] = [expected, official.get(field)]
+    if identity_mismatches or runtime_mismatches:
+        raise SystemExit(
+            "MiniMax-H3 Thor official/runtime contract mismatch: "
+            + json.dumps(
+                {"identity": identity_mismatches, "runtime": runtime_mismatches},
+                sort_keys=True,
+            )
+        )
 
 
 def sanitize_id(value: str) -> str:
@@ -575,6 +757,60 @@ def update_metadata(run_dir: Path, updates: dict[str, Any]) -> None:
     metadata_path.write_text(json.dumps(metadata, indent=2) + "\n")
 
 
+def run_local(run_dir: Path, launch_script: Path) -> int:
+    """Execute one prepared bundle and persist the local lifecycle state.
+
+    A local launch is still a real run: mark it ``running`` before spawning the
+    child so a concurrent single-flight check can see it, then distinguish a
+    zero exit from a failed launcher in metadata.
+    """
+    started_at = datetime.now(timezone.utc).isoformat()
+    update_metadata(
+        run_dir,
+        {
+            "status": "running",
+            "started_at_utc": started_at,
+            "status_reason": "local_launch_started",
+        },
+    )
+    try:
+        proc = subprocess.run([str(launch_script)])
+    except OSError as exc:
+        update_metadata(
+            run_dir,
+            {
+                "status": "failed",
+                "finished_at_utc": datetime.now(timezone.utc).isoformat(),
+                "status_reason": f"local_launch_error: {exc}",
+                "returncode": 126,
+            },
+        )
+        return 126
+    except BaseException as exc:
+        update_metadata(
+            run_dir,
+            {
+                "status": "failed",
+                "finished_at_utc": datetime.now(timezone.utc).isoformat(),
+                "status_reason": f"local_launch_interrupted: {type(exc).__name__}",
+                "returncode": 130 if isinstance(exc, KeyboardInterrupt) else 1,
+            },
+        )
+        raise
+
+    status = "completed" if proc.returncode == 0 else "failed"
+    update_metadata(
+        run_dir,
+        {
+            "status": status,
+            "finished_at_utc": datetime.now(timezone.utc).isoformat(),
+            "status_reason": "local_launch_completed" if status == "completed" else "local_launch_failed",
+            "returncode": proc.returncode,
+        },
+    )
+    return proc.returncode
+
+
 def parse_sbatch_job_id(stdout: str) -> str | None:
     match = re.search(r"Submitted batch job\s+(\S+)", stdout)
     if not match:
@@ -681,7 +917,12 @@ def validate_runtime_python(value: str, mode: str) -> None:
 def enforce_single_flight_or_exit(args: argparse.Namespace, data: dict[str, Any]) -> None:
     if os.environ.get("AUTO_VIDEO_DISABLE_SINGLE_FLIGHT_GUARD") == "1":
         return
-    if args.mode != "sbatch" or not args.confirm_submit:
+    if args.mode == "local":
+        if not is_minimax_h3_thor_config(data):
+            return
+    elif args.mode == "sbatch" and getattr(args, "confirm_submit", False):
+        pass
+    else:
         return
 
     root = repo_root()
@@ -704,9 +945,18 @@ def enforce_single_flight_or_exit(args: argparse.Namespace, data: dict[str, Any]
             continue
         run_dir = Path(str(metadata.get("run_dir") or metadata_path.parent))
         run_dir = (run_dir if run_dir.is_absolute() else root / run_dir).resolve()
+        status = str(metadata.get("status") or "").strip().lower()
+        # A recorded run can still be active.  It must remain a blocker until a
+        # collector records its terminal state; otherwise the status ledger can
+        # accidentally hide a live local process from single-flight control.
+        if status == "running":
+            blockers.append(
+                f"{run_dir} status={metadata.get('status')} job={metadata.get('slurm_job_id')}"
+            )
+            continue
         if run_dir in recorded:
             continue
-        if metadata.get("status") in NONBLOCKING_RUN_STATUSES:
+        if status in NONBLOCKING_RUN_STATUSES:
             continue
         existing_data = load_manifest_for_metadata(metadata)
         existing_config_id = config_id(existing_data) or str(
@@ -749,6 +999,7 @@ def prepare_run(
     config_path = Path(args.config).resolve()
     if data is None:
         data = merge_model_profile(load_toml(config_path))
+    data = bind_minimax_h3_thor_official_config(data)
 
     for field in ("id", "kind", "submodule", "run_script"):
         if field not in data:
@@ -790,6 +1041,11 @@ def prepare_run(
         key: str(output_dir / artifacts.get(key, default))
         for key, default in CANONICAL_ARTIFACT_DEFAULTS.items()
     }
+    # Latent-only runners may declare an alternate completion artifact without
+    # changing the ordinary video contract. Keep this key opt-in so existing
+    # manifests do not gain a misleading missing-file entry.
+    if isinstance(artifacts, dict) and "latents" in artifacts:
+        artifact_paths["latents"] = str(output_dir / artifacts["latents"])
 
     config_dry_run = None
     try:
@@ -812,6 +1068,7 @@ def prepare_run(
     # CLI env overrides that would otherwise execute a different topology under
     # the same config label.
     env["AUTOVIDEO_CONFIG_ID"] = config_id(data)
+    validate_minimax_h3_thor_runtime_contract(data, env)
     runtime_python = resolve_runtime_python(data, env)
     validate_runtime_python(runtime_python, args.mode)
 
@@ -885,6 +1142,14 @@ def main() -> int:
         help="Override or add an exported environment variable, KEY=VALUE",
     )
     parser.add_argument(
+        "--official-config",
+        action="append",
+        help=(
+            "Override one resolved official_config field for this run bundle, "
+            "KEY=VALUE; may be repeated"
+        ),
+    )
+    parser.add_argument(
         "--strict-commit",
         action="store_true",
         help="Fail if the submodule commit differs from the manifest base_commit",
@@ -908,10 +1173,12 @@ def main() -> int:
         args.mode = "sbatch"
 
     config_data = merge_model_profile(load_toml(Path(args.config).resolve()))
+    config_data = apply_official_config_overrides(config_data, args.official_config)
+    config_data = bind_minimax_h3_thor_official_config(config_data)
     enforce_gpu_readiness_or_exit(args, config_data)
     enforce_single_flight_or_exit(args, config_data)
 
-    run_dir, launch_script, job_script, data = prepare_run(args)
+    run_dir, launch_script, job_script, data = prepare_run(args, config_data)
     print(f"config: {config_id(data)}")
     print(f"run_dir: {run_dir}")
     print(f"launch_script: {launch_script}")
@@ -921,7 +1188,7 @@ def main() -> int:
         print("status: prepared (dry-run; no GPU work submitted)")
         return 0
     if args.mode == "local":
-        return subprocess.call([str(launch_script)])
+        return run_local(run_dir, launch_script)
     if args.mode == "sbatch":
         if not args.confirm_submit:
             print("status: prepared (sbatch script rendered; no job submitted)")

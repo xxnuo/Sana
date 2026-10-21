@@ -49,6 +49,10 @@ ERROR_PATTERNS = (
 )
 
 TIMING_FIELDS = ("total_s", "denoise_s", "decode_s")
+# Some runners (including the Thor MiniMax-H3 DiT-only profile) deliberately
+# stop at a latent artifact instead of materialising a video. Keep this
+# optional so the ordinary video artifact contract remains unchanged.
+LATENT_OUTPUT_TYPE = "latent"
 PRESERVED_RUNNER_BENCHMARK_FIELDS = (
     "schema_version",
     "timing_scope",
@@ -62,6 +66,15 @@ PRESERVED_RUNNER_BENCHMARK_FIELDS = (
     "max_device_memory_used_mib",
     "config",
     "aggregate",
+)
+PRESERVED_RUNNER_OUTPUT_FIELDS = (
+    "output_type",
+    "video",
+    "video_sha256",
+    "latents",
+    "latents_sha256",
+    "artifact_write_s",
+    "request_plus_artifact_s",
 )
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 LOG_TIMING_PATTERNS = {
@@ -106,11 +119,72 @@ def load_json(path: Path) -> dict[str, Any]:
         return {}
 
 
+def load_required_json(path: Path, label: str) -> dict[str, Any]:
+    """Load required evidence without conflating missing/corrupt files with empty data."""
+    if not path.is_file():
+        raise SystemExit(f"Required {label} is missing: {path}")
+    try:
+        value = json.loads(path.read_text())
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"Required {label} is malformed: {path}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise SystemExit(f"Required {label} must contain a JSON object: {path}")
+    if not value:
+        raise SystemExit(f"Required {label} must not be empty: {path}")
+    return value
+
+
 def load_toml(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {}
     with path.open("rb") as f:
         return tomllib.load(f)
+
+
+def load_required_toml(path: Path, label: str) -> dict[str, Any]:
+    """Load a required resolved manifest before creating collector outputs."""
+    if not path.is_file():
+        raise SystemExit(f"Required {label} is missing: {path}")
+    try:
+        with path.open("rb") as handle:
+            value = tomllib.load(handle)
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        raise SystemExit(f"Required {label} is malformed: {path}: {exc}") from exc
+    if not value:
+        raise SystemExit(f"Required {label} must not be empty: {path}")
+    return value
+
+
+def normalize_output_type(value: Any) -> str | None:
+    """Normalize a runner output type without assigning a mode to unknown values."""
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().lower()
+    return normalized or None
+
+
+def resolve_output_type(
+    benchmark: dict[str, Any], manifest: dict[str, Any]
+) -> tuple[str | None, str | None]:
+    """Return output type and its source, preferring runner evidence over config."""
+    direct = normalize_output_type(benchmark.get("output_type"))
+    if direct:
+        return direct, "benchmark.json"
+
+    env_tables: list[dict[str, Any]] = []
+    env = manifest.get("env")
+    if isinstance(env, dict):
+        env_tables.append(env)
+    resolved_profile = manifest.get("resolved_profile")
+    if isinstance(resolved_profile, dict):
+        resolved_env = resolved_profile.get("env")
+        if isinstance(resolved_env, dict):
+            env_tables.append(resolved_env)
+    for table in env_tables:
+        configured = normalize_output_type(table.get("H3_OUTPUT_TYPE"))
+        if configured:
+            return configured, "manifest.env.H3_OUTPUT_TYPE"
+    return None, None
 
 
 def write_json(path: Path, data: dict[str, Any]) -> None:
@@ -232,6 +306,9 @@ def parse_existing_benchmark(path: Path) -> dict[str, Any]:
     for field in PRESERVED_RUNNER_BENCHMARK_FIELDS:
         if field in data:
             timing[field] = data[field]
+    for field in PRESERVED_RUNNER_OUTPUT_FIELDS:
+        if field in data:
+            timing[field] = data[field]
 
     stage_seconds = data.get("stage_seconds")
     if isinstance(stage_seconds, dict):
@@ -278,10 +355,17 @@ def parse_existing_benchmark(path: Path) -> dict[str, Any]:
 
 def build_benchmark(benchmark_path: Path, log_path: Path, model_hint: str = "") -> dict[str, Any]:
     existing = parse_existing_benchmark(benchmark_path)
+    raw_runner = load_json(benchmark_path)
     log_timing = parse_run_log_timing(log_path)
     stage_seconds = dict(existing.get("stage_seconds") or {})
 
-    benchmark: dict[str, Any] = {}
+    # Keep workload/provenance and runner-specific evidence intact when the
+    # collector rewrites the canonical timing fields. In particular, H3's
+    # output_type and shape are needed by downstream comparison tooling.
+    collector_fields = {*TIMING_FIELDS, "stage_seconds", "sources", "collected_at_utc"}
+    benchmark: dict[str, Any] = {
+        key: value for key, value in raw_runner.items() if key not in collector_fields
+    }
     sources: dict[str, str | None] = {}
     for field in TIMING_FIELDS:
         if log_timing.get(field) is not None:
@@ -313,6 +397,9 @@ def build_benchmark(benchmark_path: Path, log_path: Path, model_hint: str = "") 
     if existing.get("memory"):
         benchmark["memory"] = existing["memory"]
     for field in PRESERVED_RUNNER_BENCHMARK_FIELDS:
+        if field in existing:
+            benchmark[field] = existing[field]
+    for field in PRESERVED_RUNNER_OUTPUT_FIELDS:
         if field in existing:
             benchmark[field] = existing[field]
     benchmark["collected_at_utc"] = datetime.now(timezone.utc).isoformat()
@@ -515,6 +602,9 @@ def determine_status(
     log_path: Path,
     video_path: Path,
     log_errors: list[str],
+    *,
+    output_type: str | None = None,
+    latent_path: Path | None = None,
 ) -> tuple[str, list[str]]:
     notes: list[str] = []
     previous = str(metadata.get("status") or "")
@@ -522,6 +612,30 @@ def determine_status(
     if log_errors:
         notes.append("log contains error patterns: " + ", ".join(log_errors))
         return "failed", notes
+
+    if output_type == LATENT_OUTPUT_TYPE:
+        # Latent-only runs intentionally do not materialise out.mp4. They still
+        # require the runner log plus a non-empty latent file before completion.
+        latent = latent_path or video_path
+        latent_ready = latent.is_file() and nonempty(latent)
+        if latent_ready and nonempty(log_path):
+            notes.append("latent output; video export not requested")
+            return "completed", notes
+
+        if previous in {"prepared", "submitted", "running"} and not log_path.exists():
+            notes.append("no run.log yet")
+            return previous or "prepared", notes
+
+        if log_path.exists() and not latent_ready:
+            notes.append("run.log exists but latent artifact is missing or empty")
+            return "failed", notes
+
+        if latent.exists() and not nonempty(log_path):
+            notes.append("latent artifact exists but run.log is missing or empty")
+            return "failed", notes
+
+        notes.append("required latent artifacts are missing")
+        return "blocked", notes
 
     if nonempty(video_path) and nonempty(log_path):
         return "completed", notes
@@ -924,6 +1038,29 @@ def build_pixel_metrics(frame_paths: list[Path], baseline_frames: list[str]) -> 
         return {"status": "blocked", "reason": str(exc)}
 
 
+def build_latent_quality(frames: dict[str, Any]) -> dict[str, Any]:
+    """Describe why video quality judges do not apply to a latent-only run."""
+    reason = "latent_output"
+    return {
+        "status": "deferred",
+        "reason": reason,
+        "collected_at_utc": datetime.now(timezone.utc).isoformat(),
+        "frame_extraction": frames,
+        "frame_metrics": {
+            "status": "deferred",
+            "reason": reason,
+            "frame_count": 0,
+        },
+        "off_identity": {"status": "not_applicable", "reason": reason},
+        "pixel_metrics": {"status": "deferred", "reason": reason},
+        "judges": {
+            "lpips": deferred(reason),
+            "nvidia_gemini": deferred(reason),
+        },
+        "promotion_blockers": [],
+    }
+
+
 def build_quality(
     run_dir: Path,
     metadata: dict[str, Any],
@@ -1020,7 +1157,10 @@ def render_patch_summary(
         if isinstance(resolved_profile, dict)
         else {}
     )
-    official = manifest.get("official_config", {}) or resolved_official
+    # `--official-config` overrides are serialized under resolved_profile.  Prefer that
+    # table over the original top-level values so a collected report describes the workload
+    # that was actually launched, not the defaults from the source TOML.
+    official = resolved_official or manifest.get("official_config", {})
     artifacts = manifest.get("artifacts", {})
     lines = [
         f"# Config Report: {metadata.get('config_id', run_dir.name)}",
@@ -1032,6 +1172,16 @@ def render_patch_summary(
         "## Config",
         "",
     ]
+    output_type = normalize_output_type(benchmark.get("output_type"))
+    if output_type:
+        lines.append(
+            f"- `output_type`: `{output_type}`"
+            + (
+                f" (source: `{benchmark.get('output_type_source')}`)"
+                if benchmark.get("output_type_source")
+                else ""
+            )
+        )
     if official:
         for key in sorted(official):
             lines.append(f"- `{key}`: `{official[key]}`")
@@ -1101,10 +1251,16 @@ def collection_payload(
     notes: list[str],
     log_errors: list[str],
 ) -> dict[str, Any]:
-    return {
+    payload = {
         "status": status,
         "run_dir": str(run_dir),
         "artifacts": {key: file_info(path) for key, path in paths.items()},
+        "output_type": normalize_output_type(benchmark.get("output_type")),
+        "output_artifact": (
+            "latents"
+            if normalize_output_type(benchmark.get("output_type")) == LATENT_OUTPUT_TYPE
+            else "video"
+        ),
         "frames": frames,
         "timing": {
             "total_s": benchmark.get("total_s"),
@@ -1116,6 +1272,7 @@ def collection_payload(
         "notes": notes,
         "log_errors": log_errors,
     }
+    return payload
 
 
 def collect(args: argparse.Namespace) -> dict[str, Any]:
@@ -1124,11 +1281,11 @@ def collect(args: argparse.Namespace) -> dict[str, Any]:
         raise SystemExit(f"Run directory does not exist: {run_dir}")
 
     metadata_path = run_dir / "metadata.json"
-    metadata = load_json(metadata_path)
-    if not metadata:
-        raise SystemExit(f"Missing or invalid metadata.json: {metadata_path}")
+    metadata = load_required_json(metadata_path, "metadata.json")
 
-    manifest = load_toml(run_dir / "manifest.resolved.toml")
+    manifest = load_required_toml(
+        run_dir / "manifest.resolved.toml", "manifest.resolved.toml"
+    )
     artifacts = manifest.get("artifacts", {})
     output_dir = run_dir / artifacts.get("output_dir", "outputs")
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1143,6 +1300,10 @@ def collect(args: argparse.Namespace) -> dict[str, Any]:
         "collection": output_dir / artifacts.get("collection", "collection.json"),
         "patch_summary": output_dir / artifacts.get("patch_summary", "patch_summary.md"),
     }
+    # benchmark.json is runner-owned evidence. Validate it before build_benchmark
+    # or any collector output is written, so a missing/corrupt result cannot be
+    # replaced by a synthetic timing-only document.
+    load_required_json(paths["benchmark"], "benchmark.json")
     frames_dir = output_dir / artifacts.get("frames_dir", "frames")
 
     # The run self-describes its model and frame count via run_config.json
@@ -1168,6 +1329,16 @@ def collect(args: argparse.Namespace) -> dict[str, Any]:
 
     log_errors = detect_log_errors(paths["log"])
     benchmark = build_benchmark(paths["benchmark"], paths["log"], model_hint=model_hint)
+    output_type, output_type_source = resolve_output_type(benchmark, manifest)
+    if output_type:
+        benchmark["output_type"] = output_type
+        benchmark["output_type_source"] = output_type_source
+    latent_output = output_type == LATENT_OUTPUT_TYPE
+    if latent_output:
+        # The runner's default is latents.safetensors; a manifest may override
+        # the filename through [artifacts].latents.
+        latent_name = artifacts.get("latents", "latents.safetensors")
+        paths["latents"] = output_dir / str(latent_name)
     write_json(paths["benchmark"], benchmark)
 
     status, notes = determine_status(
@@ -1175,10 +1346,18 @@ def collect(args: argparse.Namespace) -> dict[str, Any]:
         paths["log"],
         paths["video"],
         log_errors,
+        output_type=output_type,
+        latent_path=paths.get("latents"),
     )
 
-    should_extract = args.extract_frames or (status == "completed" and not args.no_extract_frames)
-    if should_extract:
+    should_extract = (
+        not latent_output
+        and (args.extract_frames or (status == "completed" and not args.no_extract_frames))
+    )
+    if latent_output:
+        existing = len(list(frames_dir.glob("f_*.png"))) if frames_dir.exists() else 0
+        frames = {"status": "skipped", "reason": "latent_output", "count": existing}
+    elif should_extract:
         frames = extract_frames(
             paths["video"],
             frames_dir,
@@ -1191,17 +1370,20 @@ def collect(args: argparse.Namespace) -> dict[str, Any]:
         existing = len(list(frames_dir.glob("f_*.png"))) if frames_dir.exists() else 0
         frames = {"status": "skipped", "reason": "disabled", "count": existing}
 
-    quality = build_quality(
-        run_dir,
-        metadata,
-        frames_dir,
-        frames,
-        resolve_baseline_frames(args),
-        args.skip_judges,
-        config_video=paths["video"],
-        baseline_video=resolve_baseline_video(args),
-        side_by_side_video=paths["side_by_side_video"],
-    )
+    if latent_output:
+        quality = build_latent_quality(frames)
+    else:
+        quality = build_quality(
+            run_dir,
+            metadata,
+            frames_dir,
+            frames,
+            resolve_baseline_frames(args),
+            args.skip_judges,
+            config_video=paths["video"],
+            baseline_video=resolve_baseline_video(args),
+            side_by_side_video=paths["side_by_side_video"],
+        )
     write_json(paths["quality"], quality)
     paths["risk_notes"].write_text(render_risk_notes(metadata))
     write_json(
@@ -1241,6 +1423,9 @@ def collect(args: argparse.Namespace) -> dict[str, Any]:
                     "denoise_s": benchmark.get("denoise_s"),
                     "decode_s": benchmark.get("decode_s"),
                 },
+                "output_type": output_type,
+                "output_type_source": output_type_source,
+                "output_artifact": "latents" if latent_output else "video",
             },
         }
     )
@@ -1257,6 +1442,9 @@ def collect(args: argparse.Namespace) -> dict[str, Any]:
         "quality": str(paths["quality"]),
         "risk_notes": str(paths["risk_notes"]),
         "frames": frames,
+        "output_type": output_type,
+        "output_artifact": "latents" if latent_output else "video",
+        "latents": str(paths["latents"]) if latent_output else None,
         "notes": notes,
     }
 

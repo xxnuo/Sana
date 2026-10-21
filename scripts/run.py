@@ -49,7 +49,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -180,6 +179,14 @@ def split_config(cfg: dict[str, object], path: Path) -> tuple[dict, dict]:
     return launcher, env
 
 
+def prepare_guarded_local_run(
+    args: argparse.Namespace, data: dict
+) -> tuple[Path, Path, Path, dict]:
+    """Apply single-flight control before creating a local run bundle."""
+    launch_config.enforce_single_flight_or_exit(args, data)
+    return launch_config.prepare_run(args, data)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -255,20 +262,23 @@ def main() -> int:
                 raise SystemExit(
                     f"run script does not exist: {REPO / str(root) / str(script)}"
                 )
-        run_dir, launch_script, _job, _data = launch_config.prepare_run(
-            launch_args, launch_config.merge_model_profile(cfg)
-        )
+        data = launch_config.merge_model_profile(cfg)
+        if args.print_only:
+            run_dir, launch_script, _job, _data = launch_config.prepare_run(
+                launch_args, data
+            )
+        else:
+            run_dir, launch_script, _job, _data = prepare_guarded_local_run(
+                launch_args, data
+            )
         print(f"config: {cfg.get('id', config_path.stem)}")
         print(f"run_dir  : {run_dir}")
         if args.print_only:
             print("status: printed only, nothing run")
             return 0
-        proc = subprocess.run([str(launch_script)])
-        launch_config.update_metadata(
-            run_dir, {"status": "completed", "returncode": proc.returncode}
-        )
-        print(f"status: exit {proc.returncode}  ({run_dir})")
-        return proc.returncode
+        returncode = launch_config.run_local(run_dir, launch_script)
+        print(f"status: exit {returncode}  ({run_dir})")
+        return returncode
 
     launcher, env = split_config(cfg, config_path)
 
@@ -328,12 +338,11 @@ def main() -> int:
         confirm_submit=False,
         allow_unsupported_gpu=True,
     )
-    run_dir, launch_script, _job, _data = launch_config.prepare_run(launch_args, data)
+    run_dir, launch_script, _job, _data = prepare_guarded_local_run(launch_args, data)
     print(f"run_dir : {run_dir}")
-    proc = subprocess.run([str(launch_script)])
-    launch_config.update_metadata(run_dir, {"status": "completed", "returncode": proc.returncode})
-    print(f"status: exit {proc.returncode}  ({run_dir})")
-    return proc.returncode
+    returncode = launch_config.run_local(run_dir, launch_script)
+    print(f"status: exit {returncode}  ({run_dir})")
+    return returncode
 
 
 if __name__ == "__main__":
